@@ -30,11 +30,9 @@ except ImportError:
 
 print("\n[3] Загрузка настроек...")
 GROUP_TOKEN = os.environ.get('VK_TOKEN')
-MANAGER_CHAT_ID = int(os.environ.get('MANAGER_CHAT_ID', 0))
 TARGET_CHAT_ID = int(os.environ.get('TARGET_CHAT_ID', 0))
 
 print(f"    VK_TOKEN: {'✅ Установлен' if GROUP_TOKEN else '❌ НЕ УСТАНОВЛЕН'}")
-print(f"    MANAGER_CHAT_ID: {MANAGER_CHAT_ID}")
 print(f"    TARGET_CHAT_ID: {TARGET_CHAT_ID}")
 
 if not GROUP_TOKEN:
@@ -77,6 +75,13 @@ tasks_lock = threading.Lock()
 temp_text = None
 temp_datetime = None
 
+# Устанавливаем московский часовой пояс
+MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
+
+def get_now_moscow():
+    """Возвращает текущее московское время с округлением до секунды"""
+    return datetime.datetime.now(MOSCOW_TZ).replace(microsecond=0)
+
 def send_message(peer_id, text):
     try:
         vk.messages.send(peer_id=peer_id, message=text, random_id=get_random_id())
@@ -88,25 +93,32 @@ def send_message(peer_id, text):
 
 def schedule_checker():
     print("[Поток] ✅ Запущен")
+    print(f"[Поток] Текущее московское время: {get_now_moscow().strftime('%Y-%m-%d %H:%M:%S')}")
+    
     while True:
-        now = datetime.datetime.now()
+        now = get_now_moscow()
         tasks_to_send = []
+        
         with tasks_lock:
             remaining_tasks = []
             for task in scheduled_tasks:
-                if task['datetime'] <= now:
+                task_time = task['datetime'].replace(microsecond=0)
+                if task_time <= now:
                     tasks_to_send.append(task)
+                    print(f"[Поток] ⏰ Пора отправлять: {task['id']} на {task_time}")
                 else:
                     remaining_tasks.append(task)
             scheduled_tasks[:] = remaining_tasks
+        
         for task in tasks_to_send:
             send_message(task['peer_id'], task['message'])
             print(f"    ✅ Отправлено запланированное сообщение #{task['id']}")
-        time.sleep(1)
+        
+        time.sleep(5)
 
 def parse_datetime(datetime_str):
     datetime_str = datetime_str.strip()
-    now = datetime.datetime.now()
+    now = get_now_moscow()
     
     match = re.match(r'^(\d{1,2}):(\d{2})$', datetime_str)
     if match:
@@ -134,7 +146,7 @@ def parse_datetime(datetime_str):
                 if month < now.month:
                     target_year += 1
             try:
-                target = datetime.datetime(target_year, month, day, hours, minutes, 0, 0)
+                target = datetime.datetime(target_year, month, day, hours, minutes, 0, 0, tzinfo=MOSCOW_TZ)
                 if target < now and target.date() != now.date():
                     target = target.replace(year=target.year + 1)
                 return target
@@ -157,9 +169,16 @@ def format_task_list():
     current_part = header
     current_count = 0
     
+    now = get_now_moscow()
+    
     for i, task in enumerate(sorted_tasks, 1):
         datetime_str = task['datetime'].strftime("%d.%m.%Y в %H:%M")
-        task_text = f"{i}. ID: {task['id']}\n"
+        
+        status = ""
+        if task['datetime'] < now:
+            status = " ⚠️ ПРОСРОЧЕНО!"
+        
+        task_text = f"{i}. ID: {task['id']}{status}\n"
         task_text += f"   Время: {datetime_str}\n"
         task_text += f"   Текст: {task['message']}\n"
         task_text += f"\n   Для отмены: !отмена {task['id']}\n"
@@ -189,7 +208,12 @@ def format_task_list():
     return parts
 
 def show_commands(peer_id):
-    commands_text = """🤖 БОТ ОТЛОЖЕННЫХ СООБЩЕНИЙ
+    now = get_now_moscow()
+    time_str = now.strftime("%d.%m.%Y %H:%M:%S")
+    
+    commands_text = f"""🤖 БОТ ОТЛОЖЕННЫХ СООБЩЕНИЙ
+
+🕐 ТЕКУЩЕЕ МОСКОВСКОЕ ВРЕМЯ: {time_str}
 
 ================================
 
@@ -200,7 +224,7 @@ def show_commands(peer_id):
 
 ================================
 
-ФОРМАТЫ ВРЕМЕНИ
+ФОРМАТЫ ВРЕМЕНИ (МОСКОВСКОЕ)
 
 14:30 - сегодня (или завтра если время прошло)
 15.04 14:30 - 15 апреля в 14:30
@@ -346,8 +370,8 @@ def main():
     global temp_text, temp_datetime, TARGET_CHAT_ID
     print("\n" + "=" * 60)
     print("БОТ ЗАПУЩЕН! Готов к работе.")
-    print(f"Управляющий чат ID: {MANAGER_CHAT_ID}")
     print(f"Целевой чат ID: {TARGET_CHAT_ID}")
+    print(f"Текущее московское время: {get_now_moscow().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     
     checker_thread = threading.Thread(target=schedule_checker, daemon=True)
@@ -359,9 +383,6 @@ def main():
         if event.type == VkBotEventType.MESSAGE_NEW and event.from_chat:
             peer_id = event.obj.message['peer_id']
             text = event.obj.message.get('text', '').strip()
-            
-            if peer_id != MANAGER_CHAT_ID:
-                continue
             
             print(f"[Событие] Чат: {peer_id} | Текст: {text}")
             
@@ -395,7 +416,6 @@ def main():
                 try:
                     new_chat_id = int(parts[1].strip())
                     
-                    # Переносим отложенные сообщения в новый чат
                     with tasks_lock:
                         moved_count = len(scheduled_tasks)
                         for task in scheduled_tasks:
@@ -405,7 +425,6 @@ def main():
                     
                     TARGET_CHAT_ID = new_chat_id
                     
-                    # Сохраняем в файл .env
                     try:
                         with open('.env', 'r', encoding='utf-8') as f:
                             lines = f.readlines()
