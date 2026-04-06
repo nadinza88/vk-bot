@@ -114,7 +114,17 @@ def schedule_checker():
             send_message(task['peer_id'], task['message'])
             print(f"    ✅ Отправлено запланированное сообщение #{task['id']}")
         
-        time.sleep(5)
+        # Оптимизированная задержка
+        if scheduled_tasks:
+            next_task = min(scheduled_tasks, key=lambda x: x['datetime'])
+            wait_seconds = (next_task['datetime'] - now).total_seconds()
+            if wait_seconds > 0:
+                wait_seconds = min(wait_seconds, 60)
+                time.sleep(wait_seconds)
+            else:
+                time.sleep(5)
+        else:
+            time.sleep(60)
 
 def parse_datetime(datetime_str):
     datetime_str = datetime_str.strip()
@@ -383,6 +393,11 @@ def main():
         if event.type == VkBotEventType.MESSAGE_NEW and event.from_chat:
             peer_id = event.obj.message['peer_id']
             text = event.obj.message.get('text', '').strip()
+            
+            # ИГНОРИРУЕМ команды в целевой беседе (куда отправляются отложенные сообщения)
+            if peer_id == TARGET_CHAT_ID:
+                print(f"[Событие] Чат: {peer_id} | Текст: {text} | ⏭️ ИГНОРИРУЕМ (целевая беседа)")
+                continue
             
             print(f"[Событие] Чат: {peer_id} | Текст: {text}")
             
