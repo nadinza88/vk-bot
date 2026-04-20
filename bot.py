@@ -5,6 +5,7 @@ import datetime
 import re
 import sys
 import uuid
+import json
 
 print("=" * 60)
 print("ЗАПУСК БОТА - НАЧАЛО")
@@ -75,12 +76,82 @@ tasks_lock = threading.Lock()
 temp_text = None
 temp_datetime = None
 
+# Используем персистентную папку для хранения данных
+# На BotHost это /app/data, на других хостингах может быть /data
+DATA_DIR = os.environ.get('DATA_DIR', '/app/data')
+os.makedirs(DATA_DIR, exist_ok=True)
+TASKS_FILE = os.path.join(DATA_DIR, 'tasks.json')
+
+print(f"\n[7] Папка для данных: {DATA_DIR}")
+print(f"    Файл задач: {TASKS_FILE}")
+
 # Устанавливаем московский часовой пояс
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
 def get_now_moscow():
     """Возвращает текущее московское время с округлением до секунды"""
     return datetime.datetime.now(MOSCOW_TZ).replace(microsecond=0)
+
+def save_tasks():
+    """Сохраняет задачи в файл"""
+    try:
+        with tasks_lock:
+            tasks_to_save = []
+            for task in scheduled_tasks:
+                tasks_to_save.append({
+                    'id': task['id'],
+                    'datetime': task['datetime'].isoformat(),
+                    'message': task['message'],
+                    'peer_id': task['peer_id']
+                })
+        with open(TASKS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tasks_to_save, f, ensure_ascii=False, indent=2)
+        print(f"    💾 Сохранено {len(tasks_to_save)} задач в {TASKS_FILE}")
+        return True
+    except Exception as e:
+        print(f"    ❌ Ошибка сохранения: {e}")
+        return False
+
+def load_tasks():
+    """Загружает задачи из файла"""
+    global scheduled_tasks
+    if not os.path.exists(TASKS_FILE):
+        print(f"    📭 Файл {TASKS_FILE} не найден (пустой список)")
+        return
+    
+    try:
+        with open(TASKS_FILE, 'r', encoding='utf-8') as f:
+            tasks_data = json.load(f)
+        
+        loaded_tasks = []
+        now = get_now_moscow()
+        expired_count = 0
+        
+        for task_data in tasks_data:
+            task_time = datetime.datetime.fromisoformat(task_data['datetime'])
+            # Пропускаем просроченные задачи (старше текущего времени)
+            if task_time < now:
+                expired_count += 1
+                print(f"    ⏭️ Пропущена просроченная задача: {task_data['id']} на {task_time}")
+                continue
+            loaded_tasks.append({
+                'id': task_data['id'],
+                'datetime': task_time,
+                'message': task_data['message'],
+                'peer_id': task_data['peer_id']
+            })
+        
+        with tasks_lock:
+            scheduled_tasks = loaded_tasks
+        
+        print(f"    📂 Загружено {len(loaded_tasks)} задач (пропущено просроченных: {expired_count})")
+        if loaded_tasks:
+            for task in loaded_tasks:
+                print(f"       - {task['id']}: {task['datetime'].strftime('%d.%m.%Y %H:%M')} -> {task['message'][:30]}...")
+        return True
+    except Exception as e:
+        print(f"    ❌ Ошибка загрузки: {e}")
+        return False
 
 def send_message(peer_id, text):
     try:
@@ -94,6 +165,8 @@ def send_message(peer_id, text):
 def schedule_checker():
     print("[Поток] ✅ Запущен")
     print(f"[Поток] Текущее московское время: {get_now_moscow().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    last_save_time = get_now_moscow()
     
     while True:
         now = get_now_moscow()
@@ -110,9 +183,18 @@ def schedule_checker():
                     remaining_tasks.append(task)
             scheduled_tasks[:] = remaining_tasks
         
+        # Сохраняем задачи после отправки (если были изменения)
+        if tasks_to_send:
+            save_tasks()
+        
         for task in tasks_to_send:
             send_message(task['peer_id'], task['message'])
             print(f"    ✅ Отправлено запланированное сообщение #{task['id']}")
+        
+        # Автосохранение каждые 60 секунд (на случай новых задач)
+        if (now - last_save_time).total_seconds() >= 60:
+            save_tasks()
+            last_save_time = now
         
         # Оптимизированная задержка
         if scheduled_tasks:
@@ -331,6 +413,10 @@ def try_save_message(peer_id):
         save_msg += f"Отменить: !отмена {task_id}"
         
         send_message(peer_id, save_msg)
+        
+        # Сохраняем задачи в файл
+        save_tasks()
+        
         temp_datetime = None
         temp_text = None
         return True
@@ -347,6 +433,9 @@ def cancel_task(peer_id, task_id):
                 cancel_msg += f"Текст: {removed['message'][:100]}\n"
                 cancel_msg += f"Время: {datetime_str} (МСК)"
                 send_message(peer_id, cancel_msg)
+                
+                # Сохраняем изменения
+                save_tasks()
                 return True
     
     send_message(peer_id, f"❌ Сообщение с ID {task_id} не найдено\n\nПроверьте ID командой !план")
@@ -368,6 +457,9 @@ def cancel_all_tasks(peer_id):
     if count > 5:
         cancel_msg += f"\n...и ещё {count - 5} сообщений"
     send_message(peer_id, cancel_msg)
+    
+    # Сохраняем изменения
+    save_tasks()
 
 def check_connection(peer_id):
     success = send_message(TARGET_CHAT_ID, "🔌 связь установлена")
@@ -383,6 +475,10 @@ def main():
     print(f"Целевой чат ID: {TARGET_CHAT_ID}")
     print(f"Текущее московское время: {get_now_moscow().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
+    
+    # Загружаем сохранённые задачи
+    print("\n[8] Загрузка сохранённых задач...")
+    load_tasks()
     
     checker_thread = threading.Thread(target=schedule_checker, daemon=True)
     checker_thread.start()
@@ -420,6 +516,7 @@ def main():
             elif text == '!стоп':
                 send_message(peer_id, "🛑 Бот останавливается...")
                 print("\nБот остановлен командой !стоп")
+                save_tasks()
                 os._exit(0)
             elif text == '!id':
                 send_message(peer_id, f"ID этого чата: {peer_id}")
@@ -439,6 +536,9 @@ def main():
                             send_message(peer_id, f"📦 Перенесено {moved_count} отложенных сообщений в новую беседу")
                     
                     TARGET_CHAT_ID = new_chat_id
+                    
+                    # Сохраняем изменения
+                    save_tasks()
                     
                     try:
                         with open('.env', 'r', encoding='utf-8') as f:
@@ -498,6 +598,8 @@ if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\nБот остановлен")
+        print("\nБот остановлен пользователем")
+        save_tasks()
     except Exception as e:
         print(f"Ошибка: {e}")
+        save_tasks()
